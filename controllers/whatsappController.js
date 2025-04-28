@@ -4,26 +4,30 @@ const qrcode = require('qrcode');
 const fs = require('fs');
 const path = require('path');
 
-// Store the socket connection
-let sock = null;
-let qr = null;
-let isConnected = false;
-let disconnectTimer = null;
-let isManualDisconnect = false;
+// Store the socket connections
+let sessions = new Map();
 
-// Create auth folder if it doesn't exist
-const AUTH_FOLDER = path.join(__dirname, '../auth');
-if (!fs.existsSync(AUTH_FOLDER)) {
-    fs.mkdirSync(AUTH_FOLDER);
-}
+// Function to get auth folder path for a phone number
+const getAuthPath = (phoneNumber) => {
+    // Validate phone number format
+    if (!phoneNumber || !/^[0-9]+$/.test(phoneNumber)) {
+        throw new Error('Invalid phone number format');
+    }
+    return path.join(__dirname, `../auth/auth-${phoneNumber}`);
+};
 
 // Function to safely end socket
-const safeEndSocket = () => {
+const safeEndSocket = (phoneNumber) => {
     try {
-        if (sock) {
-            sock.ev.removeAllListeners();
-            sock.end();
-            sock = null;
+        const session = sessions.get(phoneNumber);
+        if (session?.sock) {
+            session.sock.ev.removeAllListeners();
+            session.sock.end();
+            sessions.set(phoneNumber, { 
+                ...session,
+                sock: null,
+                isConnected: false 
+            });
         }
     } catch (error) {
         console.log('Error closing socket:', error);
@@ -31,58 +35,86 @@ const safeEndSocket = () => {
 };
 
 // Function to generate QR and handle auth
-const generateQR = async () => {
+const generateQR = async (phoneNumber) => {
     try {
-        const { state, saveCreds } = await useMultiFileAuthState('auth');
+        const AUTH_FOLDER = getAuthPath(phoneNumber);
+        
+        // Create auth folder if it doesn't exist
+        if (!fs.existsSync(AUTH_FOLDER)) {
+            fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+        }
+
+        const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
         
         // Safely end existing socket if any
-        safeEndSocket();
+        safeEndSocket(phoneNumber);
         
-        sock = makeWASocket({
-            printQRInTerminal: false, // Disable QR in terminal
+        const sock = makeWASocket({
+            printQRInTerminal: false,
             auth: state,
             defaultQueryTimeoutMs: undefined
+        });
+
+        // Initialize or update session
+        sessions.set(phoneNumber, {
+            sock,
+            qr: null,
+            isConnected: false,
+            isManualDisconnect: false,
+            disconnectTimer: null
         });
 
         // Handle connection updates
         sock.ev.on('connection.update', async (update) => {
             try {
                 const { connection, lastDisconnect, qr: currentQr } = update;
+                const session = sessions.get(phoneNumber);
 
                 if (currentQr) {
                     // Generate QR code as base64
-                    qr = await qrcode.toDataURL(currentQr);
+                    const qrCode = await qrcode.toDataURL(currentQr);
+                    sessions.set(phoneNumber, { ...session, qr: qrCode });
                 }
 
                 if (connection === 'close') {
-                    const shouldReconnect = !isManualDisconnect && (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-                    isConnected = false;
+                    const shouldReconnect = !session.isManualDisconnect && 
+                        (lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
                     
                     // Clear disconnect timer if exists
-                    if (disconnectTimer) {
-                        clearTimeout(disconnectTimer);
-                        disconnectTimer = null;
+                    if (session.disconnectTimer) {
+                        clearTimeout(session.disconnectTimer);
                     }
                     
+                    sessions.set(phoneNumber, {
+                        ...session,
+                        isConnected: false,
+                        disconnectTimer: null
+                    });
+                    
                     if (shouldReconnect) {
-                        generateQR().catch(console.error);
+                        generateQR(phoneNumber).catch(console.error);
                     }
                 }
 
                 if (connection === 'open') {
-                    isConnected = true;
-                    isManualDisconnect = false;
-                    console.log('Connected to WhatsApp, will disconnect in 5 seconds');
+                    console.log(`Connected to WhatsApp for ${phoneNumber}, will disconnect in 5 seconds`);
                     
                     // Set timer to disconnect after 5 seconds
-                    disconnectTimer = setTimeout(() => {
-                        console.log('Disconnecting after 5 seconds timeout');
-                        if (sock) {
-                            isManualDisconnect = true;
-                            safeEndSocket();
-                            isConnected = false;
-                        }
-                    }, 5000); // 5 seconds
+                    const disconnectTimer = setTimeout(() => {
+                        console.log(`Disconnecting ${phoneNumber} after 5 seconds timeout`);
+                        sessions.set(phoneNumber, {
+                            ...sessions.get(phoneNumber),
+                            isManualDisconnect: true
+                        });
+                        safeEndSocket(phoneNumber);
+                    }, 5000);
+
+                    sessions.set(phoneNumber, {
+                        ...session,
+                        isConnected: true,
+                        isManualDisconnect: false,
+                        disconnectTimer
+                    });
                 }
             } catch (error) {
                 console.error('Error in connection update handler:', error);
@@ -105,12 +137,12 @@ const generateQR = async () => {
 
         // Handle unexpected socket close
         sock.ws.on('close', () => {
-            console.log('WebSocket closed');
+            console.log(`WebSocket closed for ${phoneNumber}`);
         });
 
         // Handle socket errors
         sock.ws.on('error', (err) => {
-            console.error('WebSocket error:', err);
+            console.error(`WebSocket error for ${phoneNumber}:`, err);
         });
 
     } catch (error) {
@@ -119,67 +151,38 @@ const generateQR = async () => {
     }
 };
 
-// Function to connect to WhatsApp using saved auth
-const connectToWhatsApp = async () => {
-    try {
-        if (isConnected) {
-            return { success: true, message: 'Already connected to WhatsApp' };
-        }
-
-        // Check if auth files exist
-        const authFiles = fs.readdirSync('auth');
-        if (authFiles.length === 0) {
-            return { success: false, message: 'No authentication data found. Please scan QR code first' };
-        }
-
-        const { state } = await useMultiFileAuthState('auth');
-        
-        // If sock exists, close it first
-        if (sock) {
-            isManualDisconnect = true;
-            safeEndSocket();
-        }
-
-        // Clear any existing disconnect timer
-        if (disconnectTimer) {
-            clearTimeout(disconnectTimer);
-            disconnectTimer = null;
-        }
-
-        isManualDisconnect = false;
-
-        // Create new connection
-        sock = makeWASocket({
-            printQRInTerminal: false,
-            auth: state,
-            defaultQueryTimeoutMs: undefined
-        });
-
-        return { success: true, message: 'Successfully connected to WhatsApp' };
-    } catch (error) {
-        console.error('Error in connectToWhatsApp:', error);
-        return { success: false, message: 'Failed to connect to WhatsApp' };
-    }
-};
-
 // Controller to get QR code
 const getQRCode = async (req, res) => {
     try {
+        const { phone } = req.query;
+        
+        if (!phone) {
+            return res.status(400).json({
+                success: false,
+                message: 'Phone number is required as query parameter'
+            });
+        }
+
         // Reset QR code
-        qr = null;
-        isManualDisconnect = false;
+        const session = sessions.get(phone) || {};
+        sessions.set(phone, { 
+            ...session,
+            qr: null,
+            isManualDisconnect: false 
+        });
         
         // Generate new QR
-        await generateQR();
+        await generateQR(phone);
 
         // Wait for QR to be generated
         let attempts = 0;
-        while (!qr && attempts < 20) {
+        while (!sessions.get(phone)?.qr && attempts < 20) {
             await new Promise(resolve => setTimeout(resolve, 500));
             attempts++;
         }
 
-        if (!qr) {
+        const currentSession = sessions.get(phone);
+        if (!currentSession?.qr) {
             return res.status(408).json({ 
                 success: false, 
                 message: 'QR Code generation timeout' 
@@ -188,30 +191,13 @@ const getQRCode = async (req, res) => {
 
         res.json({ 
             success: true, 
-            qr: qr 
+            qr: currentSession.qr 
         });
     } catch (error) {
         console.error('Error in getQRCode:', error);
         res.status(500).json({ 
             success: false, 
-            message: 'Internal server error' 
-        });
-    }
-};
-
-// Controller to connect to WhatsApp
-const connect = async (req, res) => {
-    try {
-        const result = await connectToWhatsApp();
-        if (!result.success) {
-            return res.status(400).json(result);
-        }
-        res.json(result);
-    } catch (error) {
-        console.error('Error in connect:', error);
-        res.status(500).json({ 
-            success: false, 
-            message: 'Internal server error' 
+            message: error.message || 'Internal server error' 
         });
     }
 };
@@ -222,6 +208,5 @@ process.on('unhandledRejection', (error) => {
 });
 
 module.exports = {
-    getQRCode,
-    connect
+    getQRCode
 };
