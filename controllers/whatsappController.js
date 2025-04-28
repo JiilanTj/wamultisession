@@ -202,11 +202,92 @@ const getQRCode = async (req, res) => {
     }
 };
 
+// Function to connect to WhatsApp using saved auth
+const connectToWhatsApp = async (phoneNumber) => {
+    try {
+        // Validate phone number
+        if (!phoneNumber || !/^[0-9]+$/.test(phoneNumber)) {
+            throw new Error('Invalid phone number format');
+        }
+
+        const session = sessions.get(phoneNumber);
+        if (session?.isConnected) {
+            return { success: true, message: 'Already connected to WhatsApp' };
+        }
+
+        const AUTH_FOLDER = getAuthPath(phoneNumber);
+        
+        // Check if auth files exist
+        if (!fs.existsSync(AUTH_FOLDER)) {
+            return { success: false, message: 'No authentication data found. Please scan QR code first' };
+        }
+
+        const { state } = await useMultiFileAuthState(AUTH_FOLDER);
+        
+        // If sock exists, close it first
+        safeEndSocket(phoneNumber);
+
+        // Clear any existing disconnect timer
+        const currentSession = sessions.get(phoneNumber);
+        if (currentSession?.disconnectTimer) {
+            clearTimeout(currentSession.disconnectTimer);
+        }
+
+        // Create new connection
+        const sock = makeWASocket({
+            printQRInTerminal: false,
+            auth: state,
+            defaultQueryTimeoutMs: undefined
+        });
+
+        // Update session
+        sessions.set(phoneNumber, {
+            ...currentSession,
+            sock,
+            isConnected: false,
+            isManualDisconnect: false,
+            disconnectTimer: null
+        });
+
+        return { success: true, message: 'Connection process started' };
+    } catch (error) {
+        console.error('Error in connectToWhatsApp:', error);
+        return { success: false, message: error.message || 'Failed to connect to WhatsApp' };
+    }
+};
+
+// Controller to connect to WhatsApp
+const connect = async (req, res) => {
+    try {
+        const { phone } = req.query;
+        
+        if (!phone) {
+            return res.status(400).json({
+                success: false,
+                message: 'Phone number is required as query parameter'
+            });
+        }
+
+        const result = await connectToWhatsApp(phone);
+        if (!result.success) {
+            return res.status(400).json(result);
+        }
+        res.json(result);
+    } catch (error) {
+        console.error('Error in connect:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message || 'Internal server error' 
+        });
+    }
+};
+
 // Handle process-level promise rejections
 process.on('unhandledRejection', (error) => {
     console.error('Unhandled promise rejection:', error);
 });
 
 module.exports = {
-    getQRCode
+    getQRCode,
+    connect
 };
